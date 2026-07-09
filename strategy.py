@@ -1,208 +1,134 @@
 """
-Detectoare SMC: Order Block (OB), Fair Value Gap (FVG), Break of Structure (BOS).
+Strategia principală: combină Order Block (M15) + Fair Value Gap (M5) +
+Break of Structure (M1) într-un singur semnal de intrare.
 
-IMPORTANT: aceste concepte nu au o definiție universal acceptată -- fiecare
-trader ICT le definește puțin diferit. Regulile de mai jos sunt niște
-definiții algoritmice explicite și testabile, alese pentru claritate și
-reproductibilitate. Ajustează pragurile din config.py după cum vezi în
-backtesting că se comportă pe XAUUSD.
+Logica de aliniere temporală:
+1. Găsim un OB pe M15 care a fost mitigat (prețul a revenit în zonă).
+2. Căutăm un FVG pe M5, în aceeași direcție, format DUPĂ mitigarea OB,
+   într-o fereastră de `max_bars_between_ob_and_fvg` lumânări M5.
+3. Căutăm un BOS pe M1, în aceeași direcție, format DUPĂ FVG, într-o
+   fereastră de `max_bars_between_fvg_and_bos` lumânări M1.
+4. Dacă toate 3 se aliniază -> semnal de intrare, cu SL sub/peste OB și
+   TP calculat din risk:reward (sau poți înlocui cu TP structural).
 """
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 
-Direction = Literal["bullish", "bearish"]
+from config import Config
+from detectors import (
+    OrderBlock, FVG, BOSEvent,
+    detect_order_blocks, mark_mitigation, detect_fvg, detect_bos,
+)
 
 
 @dataclass
-class OrderBlock:
-    index: int              # indexul lumânării OB în df M15
-    direction: Direction
-    high: float
-    low: float
+class Signal:
     time: pd.Timestamp
-    mitigated: bool = False
-    mitigated_at: Optional[pd.Timestamp] = None
+    direction: str          # "bullish" / "bearish"
+    entry: float
+    stop_loss: float
+    take_profit: float
+    ob: OrderBlock
+    fvg: FVG
+    bos: BOSEvent
 
 
-@dataclass
-class FVG:
-    index: int
-    direction: Direction
-    top: float
-    bottom: float
-    time: pd.Timestamp
+def _in_session(ts: pd.Timestamp, cfg: Config) -> bool:
+    return cfg.session_start_hour <= ts.hour < cfg.session_end_hour
 
 
-@dataclass
-class BOSEvent:
-    index: int
-    direction: Direction
-    level: float
-    time: pd.Timestamp
+def generate_signals(m15: pd.DataFrame, m5: pd.DataFrame, m1: pd.DataFrame,
+                      cfg: Config) -> list[Signal]:
 
+    obs = detect_order_blocks(
+        m15, cfg.ob_lookback, cfg.ob_atr_period, cfg.ob_impulse_atr_mult
+    )
+    obs = [mark_mitigation(ob, m15, cfg.ob_max_age_bars) for ob in obs]
+    mitigated_obs = [ob for ob in obs if ob.mitigated]
 
-def _atr(df: pd.DataFrame, period: int) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    fvgs = detect_fvg(m5, cfg.fvg_lookback, cfg.fvg_min_size_pips, cfg.pip_size)
+    bos_events = detect_bos(m1, cfg.bos_swing_lookback, cfg.bos_confirm_close)
 
+    signals: list[Signal] = []
 
-def detect_order_blocks(df: pd.DataFrame, lookback: int, atr_period: int,
-                         impulse_atr_mult: float) -> list[OrderBlock]:
-    """
-    Regulă OB (simplificată, standard ICT):
-    - OB bullish = ultima lumânare BEARISH (close < open) înainte de o
-      mișcare impulsivă în SUS a cărei amplitudine >= impulse_atr_mult * ATR.
-    - OB bearish = ultima lumânare BULLISH înainte de o mișcare impulsivă
-      în JOS.
-    Căutăm doar în ultimele `lookback` lumânări.
-    """
-    df = df.copy()
-    df["atr"] = _atr(df, atr_period)
-    start = max(atr_period + 2, len(df) - lookback)
-
-    obs: list[OrderBlock] = []
-
-    for i in range(start, len(df) - 1):
-        atr = df["atr"].iloc[i]
-        if pd.isna(atr) or atr == 0:
+    for ob in mitigated_obs:
+        if ob.mitigated_at is None:
             continue
 
-        candle = df.iloc[i]
-        next_candle = df.iloc[i + 1]
+        # 1) căutăm FVG-uri M5 în aceeași direcție, formate după mitigare
+        candidate_fvgs = [
+            f for f in fvgs
+            if f.direction == ob.direction and f.time > ob.mitigated_at
+        ]
+        if not candidate_fvgs:
+            continue
 
-        is_bearish_candle = candle["close"] < candle["open"]
-        is_bullish_candle = candle["close"] > candle["open"]
+        # limităm la fereastra de timp permisă (aprox. în bare M5)
+        window_end = ob.mitigated_at + pd.Timedelta(
+            minutes=5 * cfg.max_bars_between_ob_and_fvg
+        )
+        candidate_fvgs = [f for f in candidate_fvgs if f.time <= window_end]
+        if not candidate_fvgs:
+            continue
 
-        # mișcare impulsivă în sus care pleacă din candela curentă
-        up_move = next_candle["close"] - candle["low"]
-        down_move = candle["high"] - next_candle["close"]
+        fvg = min(candidate_fvgs, key=lambda f: f.time)  # primul FVG relevant
 
-        if is_bearish_candle and up_move >= impulse_atr_mult * atr:
-            obs.append(OrderBlock(
-                index=i, direction="bullish",
-                high=candle["high"], low=candle["low"], time=candle["time"],
-            ))
+        # 2) căutăm BOS pe M1, aceeași direcție, după FVG
+        bos_window_end = fvg.time + pd.Timedelta(
+            minutes=1 * cfg.max_bars_between_fvg_and_bos
+        )
+        candidate_bos = [
+            b for b in bos_events
+            if b.direction == ob.direction and fvg.time < b.time <= bos_window_end
+        ]
+        if not candidate_bos:
+            continue
 
-        if is_bullish_candle and down_move >= impulse_atr_mult * atr:
-            obs.append(OrderBlock(
-                index=i, direction="bearish",
-                high=candle["high"], low=candle["low"], time=candle["time"],
-            ))
+        bos = min(candidate_bos, key=lambda b: b.time)
 
-    return obs
+        if not _in_session(bos.time, cfg):
+            continue
 
+        # --- construim semnalul ---
+        entry_row = m1[m1["time"] == bos.time]
+        if entry_row.empty:
+            continue
+        entry_price = float(entry_row["close"].iloc[0])
 
-def mark_mitigation(ob: OrderBlock, df: pd.DataFrame, max_age_bars: int) -> OrderBlock:
-    """
-    Marchează un OB ca "mitigat" în momentul în care prețul revine în
-    interiorul zonei OB (high-low) pentru prima dată după formare.
-    """
-    end = min(ob.index + 1 + max_age_bars, len(df))
-    for j in range(ob.index + 1, end):
-        bar = df.iloc[j]
+        sl_buffer = cfg.sl_buffer_pips * cfg.pip_size
         if ob.direction == "bullish":
-            touched = bar["low"] <= ob.high and bar["low"] >= ob.low
+            stop_loss = ob.low - sl_buffer
+            risk = entry_price - stop_loss
+            take_profit = entry_price + risk * cfg.rr_target
         else:
-            touched = bar["high"] >= ob.low and bar["high"] <= ob.high
-        if touched:
-            ob.mitigated = True
-            ob.mitigated_at = bar["time"]
-            ob.index = j  # reținem indexul mitigării, util pentru pasul următor
-            return ob
-    return ob
+            stop_loss = ob.high + sl_buffer
+            risk = stop_loss - entry_price
+            take_profit = entry_price - risk * cfg.rr_target
 
+        if risk <= 0:
+            continue
 
-def detect_fvg(df: pd.DataFrame, lookback: int, min_size_pips: float,
-                pip_size: float) -> list[FVG]:
-    """
-    Regulă FVG (3 lumânări consecutive: A, B, C):
-    - Bullish FVG: low(C) > high(A)  -> gap-ul este [high(A), low(C)]
-    - Bearish FVG: high(C) < low(A)  -> gap-ul este [high(C), low(A)]
-    Filtrăm după dimensiune minimă (în pips) ca să evităm gap-uri nesemnificative.
-    """
-    start = max(2, len(df) - lookback)
-    min_size = min_size_pips * pip_size
-    fvgs: list[FVG] = []
+        signals.append(Signal(
+            time=bos.time, direction=ob.direction, entry=entry_price,
+            stop_loss=stop_loss, take_profit=take_profit,
+            ob=ob, fvg=fvg, bos=bos,
+        ))
 
-    for i in range(start, len(df)):
-        a = df.iloc[i - 2]
-        c = df.iloc[i]
+    signals.sort(key=lambda s: s.time)
 
-        if c["low"] > a["high"] and (c["low"] - a["high"]) >= min_size:
-            fvgs.append(FVG(
-                index=i, direction="bullish",
-                top=c["low"], bottom=a["high"], time=c["time"],
-            ))
+    # limităm nr. de semnale/zi conform config
+    if cfg.max_trades_per_day:
+        by_day: dict = {}
+        filtered = []
+        for s in signals:
+            day = s.time.date()
+            by_day.setdefault(day, 0)
+            if by_day[day] < cfg.max_trades_per_day:
+                filtered.append(s)
+                by_day[day] += 1
+        signals = filtered
 
-        if c["high"] < a["low"] and (a["low"] - c["high"]) >= min_size:
-            fvgs.append(FVG(
-                index=i, direction="bearish",
-                top=a["low"], bottom=c["high"], time=c["time"],
-            ))
-
-    return fvgs
-
-
-def detect_bos(df: pd.DataFrame, swing_lookback: int, confirm_close: bool) -> list[BOSEvent]:
-    """
-    Regulă BOS:
-    - Identificăm swing high/low locale (fractal simplu: high mai mare
-      decât cele 2 lumânări anterioare și 2 următoare, respectiv low mai mic).
-    - BOS bullish: close (sau high, dacă confirm_close=False) depășește
-      cel mai recent swing high nedepășit.
-    - BOS bearish: analog pentru swing low.
-    """
-    highs = df["high"].values
-    lows = df["low"].values
-    n = len(df)
-
-    swing_highs = []  # (index, price)
-    swing_lows = []
-
-    for i in range(2, n - 2):
-        if highs[i] > highs[i - 1] and highs[i] > highs[i - 2] and \
-           highs[i] > highs[i + 1] and highs[i] > highs[i + 2]:
-            swing_highs.append((i, highs[i]))
-        if lows[i] < lows[i - 1] and lows[i] < lows[i - 2] and \
-           lows[i] < lows[i + 1] and lows[i] < lows[i + 2]:
-            swing_lows.append((i, lows[i]))
-
-    events: list[BOSEvent] = []
-    start = max(0, n - swing_lookback * 4)
-
-    last_swing_high = None
-    last_swing_low = None
-    sh_idx = lh_idx = 0
-
-    for i in range(start, n):
-        while sh_idx < len(swing_highs) and swing_highs[sh_idx][0] < i:
-            last_swing_high = swing_highs[sh_idx][1]
-            sh_idx += 1
-        while lh_idx < len(swing_lows) and swing_lows[lh_idx][0] < i:
-            last_swing_low = swing_lows[lh_idx][1]
-            lh_idx += 1
-
-        price_up = df["close"].iloc[i] if confirm_close else df["high"].iloc[i]
-        price_down = df["close"].iloc[i] if confirm_close else df["low"].iloc[i]
-
-        if last_swing_high is not None and price_up > last_swing_high:
-            events.append(BOSEvent(index=i, direction="bullish",
-                                    level=last_swing_high, time=df["time"].iloc[i]))
-            last_swing_high = None  # evită semnale duplicate pe același nivel
-
-        if last_swing_low is not None and price_down < last_swing_low:
-            events.append(BOSEvent(index=i, direction="bearish",
-                                    level=last_swing_low, time=df["time"].iloc[i]))
-            last_swing_low = None
-
-    return events
+    return signals

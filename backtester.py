@@ -1,45 +1,105 @@
 """
-Generează date OHLC sintetice (random-walk) M1, doar pentru CI/testing.
-NU folosi datele astea pentru backtesting real -- sunt zgomot aleator,
-nu reflectă comportamentul real al XAUUSD.
+Backtester simplu (bar-by-bar pe M1) pentru semnalele generate de strategy.py.
+
+Simplificări (importante de conștientizat):
+- Nu modelează spread/comision/slippage decât printr-un parametru fix simplu.
+- Presupune execuție instant la prețul de close al lumânării BOS (nu simulează
+  order queue sau latență reală de broker).
+- O singură poziție deschisă simultan (poți extinde pentru mai multe).
+Folosește-l ca punct de plecare, nu ca validare finală înainte de live.
 """
 
-import numpy as np
+from dataclasses import dataclass
+from typing import cast
+
 import pandas as pd
 
-
-def generate_synthetic_m1(n_bars: int = 20000, seed: int = 42,
-                           start_price: float = 2050.0,
-                           start_time: str = "2024-01-01 00:00:00") -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    times = pd.date_range(pd.Timestamp(start_time), periods=n_bars, freq="1min")
-
-    price = start_price
-    opens, highs, lows, closes = [], [], [], []
-    trend = 0.0
-
-    for i in range(n_bars):
-        if i % 300 == 0:
-            trend = rng.choice([-1, 1]) * rng.uniform(0.5, 2.0)
-        drift = trend * 0.01
-        noise = rng.normal(0, 0.15)
-        o = price
-        c = price + drift + noise
-        h = max(o, c) + abs(rng.normal(0, 0.08))
-        l = min(o, c) - abs(rng.normal(0, 0.08))
-        opens.append(o)
-        highs.append(h)
-        lows.append(l)
-        closes.append(c)
-        price = c
-
-    return pd.DataFrame({
-        "time": times, "open": opens, "high": highs,
-        "low": lows, "close": closes, "volume": 100,
-    })
+from config import Config
+from strategy import Signal
 
 
-if __name__ == "__main__":
-    df = generate_synthetic_m1()
-    df.to_csv("data/XAUUSD_M1_synthetic.csv", index=False)
-    print(f"Generat {len(df)} bare sintetice -> data/XAUUSD_M1_synthetic.csv")
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    direction: str
+    entry: float
+    exit: float
+    stop_loss: float
+    take_profit: float
+    result: str      # "TP", "SL", "EOD" (end of data)
+    pnl_pips: float
+
+
+def run_backtest(signals: list[Signal], m1: pd.DataFrame, cfg: Config,
+                  spread_pips: float = 3.0) -> list[Trade]:
+
+    trades: list[Trade] = []
+    m1_indexed = m1.set_index("time")
+    spread = spread_pips * cfg.pip_size
+
+    for sig in signals:
+        future = m1_indexed[m1_indexed.index > sig.time]
+        if future.empty:
+            continue
+
+        exit_time = pd.Timestamp(future.index[-1])
+        exit_price = future["close"].iloc[-1]
+        result = "EOD"
+
+        for ts, bar in future.iterrows():
+            ts_time = cast(pd.Timestamp, ts)
+            if sig.direction == "bullish":
+                hit_sl = bar["low"] <= sig.stop_loss
+                hit_tp = bar["high"] >= sig.take_profit
+            else:
+                hit_sl = bar["high"] >= sig.stop_loss
+                hit_tp = bar["low"] <= sig.take_profit
+
+            # dacă ambele sunt atinse în aceeași lumânare, presupunem
+            # conservator că SL-ul e lovit primul
+            if hit_sl:
+                exit_time, exit_price, result = ts_time, sig.stop_loss, "SL"
+                break
+            if hit_tp:
+                exit_time, exit_price, result = ts_time, sig.take_profit, "TP"
+                break
+
+        if sig.direction == "bullish":
+            pnl = (exit_price - sig.entry - spread) / cfg.pip_size
+        else:
+            pnl = (sig.entry - exit_price - spread) / cfg.pip_size
+
+        trades.append(Trade(
+            entry_time=sig.time, exit_time=exit_time, direction=sig.direction,
+            entry=sig.entry, exit=exit_price, stop_loss=sig.stop_loss,
+            take_profit=sig.take_profit, result=result, pnl_pips=pnl,
+        ))
+
+    return trades
+
+
+def summarize(trades: list[Trade]) -> dict:
+    if not trades:
+        return {"n_trades": 0}
+
+    wins = [t for t in trades if t.pnl_pips > 0]
+    losses = [t for t in trades if t.pnl_pips <= 0]
+    total_pips = sum(t.pnl_pips for t in trades)
+    win_rate = len(wins) / len(trades) * 100
+
+    avg_win = sum(t.pnl_pips for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t.pnl_pips for t in losses) / len(losses) if losses else 0
+
+    days = len({t.entry_time.date() for t in trades})
+
+    return {
+        "n_trades": len(trades),
+        "n_days": days,
+        "avg_trades_per_day": round(len(trades) / days, 2) if days else 0,
+        "win_rate_pct": round(win_rate, 1),
+        "total_pips": round(total_pips, 1),
+        "avg_win_pips": round(avg_win, 1),
+        "avg_loss_pips": round(avg_loss, 1),
+        "expectancy_pips": round(total_pips / len(trades), 2),
+    }

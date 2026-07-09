@@ -1,7 +1,58 @@
-venv/
-__pycache__/
-*.pyc
-data/*.csv
-state.json
-log.txt
-.env
+"""
+Data loader.
+
+Nu am acces la internet din acest mediu, deci botul citește date istorice
+din fișiere CSV locale (pe care le exporți din MT5/MT4, TradingView, sau
+le descarci cu yfinance/ccxt pe mașina ta).
+
+Format CSV așteptat (header obligatoriu):
+    time,open,high,low,close,volume
+    2024-01-02 00:00:00,2062.50,2063.10,2061.80,2062.90,1523
+
+Ai nevoie de 3 fișiere separate, unul per timeframe: M15, M5, M1.
+Dacă ai doar M1, poți genera M5 și M15 prin resample (vezi funcția
+`resample_ohlc` de mai jos).
+"""
+
+import pandas as pd
+
+
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+    required = {"time", "open", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Lipsesc coloanele {missing} din {path}")
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    return df
+
+
+def resample_ohlc(df_m1: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Reeșantionează date M1 la un timeframe mai mare.
+    rule: '5min' pentru M5, '15min' pentru M15.
+    """
+    df = df_m1.set_index("time")
+    out = df.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna().reset_index()
+    return out
+
+
+def load_multi_timeframe(m1_path: str) -> dict:
+    """
+    Pornind doar de la un CSV M1, generează și M5 și M15 prin resample.
+    Util dacă exporți o singură serie de date brute din broker.
+    """
+    m1 = load_csv(m1_path)
+    m5 = resample_ohlc(m1, "5min")
+    m15 = resample_ohlc(m1, "15min")
+    return {"M1": m1, "M5": m5, "M15": m15}
+
+

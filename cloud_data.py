@@ -9,12 +9,15 @@ per rulare (M1+M5+M15), ramai confortabil in limita free tier.
 """
 
 import json
+import ssl
 import urllib.request
 import urllib.parse
 
+import certifi
 import pandas as pd
 
 BASE_URL = "https://api.twelvedata.com/time_series"
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 def fetch_series(symbol: str, interval: str, outputsize: int, api_key: str) -> pd.DataFrame:
@@ -27,7 +30,7 @@ def fetch_series(symbol: str, interval: str, outputsize: int, api_key: str) -> p
     }
     url = f"{BASE_URL}?{urllib.parse.urlencode(params)}"
 
-    with urllib.request.urlopen(url, timeout=20) as resp:
+    with urllib.request.urlopen(url, timeout=20, context=SSL_CONTEXT) as resp:
         body = json.loads(resp.read().decode())
 
     if body.get("status") == "error":
