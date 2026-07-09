@@ -27,6 +27,7 @@ def fetch_series(symbol: str, interval: str, outputsize: int, api_key: str) -> p
         "outputsize": outputsize,
         "apikey": api_key,
         "order": "ASC",
+        "timezone": "UTC",
     }
     url = f"{BASE_URL}?{urllib.parse.urlencode(params)}"
 
@@ -52,12 +53,25 @@ def fetch_series(symbol: str, interval: str, outputsize: int, api_key: str) -> p
     return df
 
 
-def get_multi_timeframe_cloud(api_key: str, symbol: str = "XAU/USD") -> dict:
+def get_multi_timeframe_cloud(
+    api_key: str,
+    symbol: str = "XAU/USD",
+    m1_outputsize: int | None = None,
+    m5_outputsize: int = 400,
+    m15_outputsize: int = 200,
+) -> dict:
     """
-    Aduce M1, M5, M15 direct din API (nu prin resample local), fiecare cu
-    outputsize suficient pentru lookback-urile din config.py.
+    Aduce M1, M5, M15 direct din API (nu prin resample local).
+
+    Important: pentru alinierea OB(M15)->FVG(M5)->BOS(M1), seria M1 trebuie
+    să acopere cel puțin aceeași fereastră temporală ca M5/M15. Dacă
+    m1_outputsize nu e dat explicit, îl calculăm automat din celelalte două.
     """
-    m1 = fetch_series(symbol, "1min", outputsize=500, api_key=api_key)
-    m5 = fetch_series(symbol, "5min", outputsize=400, api_key=api_key)
-    m15 = fetch_series(symbol, "15min", outputsize=200, api_key=api_key)
+    if m1_outputsize is None:
+        # Acoperire minimă în minute: M15(15m/bar) și M5(5m/bar).
+        m1_outputsize = max(m15_outputsize * 15, m5_outputsize * 5)
+
+    m1 = fetch_series(symbol, "1min", outputsize=m1_outputsize, api_key=api_key)
+    m5 = fetch_series(symbol, "5min", outputsize=m5_outputsize, api_key=api_key)
+    m15 = fetch_series(symbol, "15min", outputsize=m15_outputsize, api_key=api_key)
     return {"M1": m1, "M5": m5, "M15": m15}

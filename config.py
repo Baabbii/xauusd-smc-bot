@@ -41,4 +41,4 @@ class Config:
 
     # --- Validitate semnal ---
     max_bars_between_ob_and_fvg: int = 40   # FVG trebuie să apară "aproape" de mitigarea OB
-    max_bars_between_fvg_and_bos: int = 15  # BOS trebuie confirmat curând după FVG
+    max_bars_between_fvg_and_bos: int = 240  # BOS poate apărea mai târziu în practică

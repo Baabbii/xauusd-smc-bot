@@ -8,6 +8,9 @@ setate de workflow (din GitHub Secrets), NU dintr-un fișier .env local.
 
 import json
 import os
+from datetime import datetime, timedelta
+
+import pandas as pd
 
 from config import Config
 from cloud_data import get_multi_timeframe_cloud
@@ -18,10 +21,21 @@ STATE_FILE = "state.json"
 
 
 def load_state() -> dict:
+    now = datetime.now()
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"last_alerted_time": None}
+            state = json.load(f)
+
+        last_time = state.get("last_alerted_time")
+        if last_time:
+            parsed = pd.to_datetime(last_time, errors="coerce")
+            if pd.notna(parsed):
+                last_dt = parsed.to_pydatetime().replace(tzinfo=None)
+                # Dacă timestamp-ul din state e în viitor, îl aducem la "acum".
+                if last_dt > now + timedelta(minutes=5):
+                    state["last_alerted_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        return state
+    return {"last_alerted_time": now.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 def save_state(state: dict) -> None:
@@ -48,7 +62,15 @@ def main():
 
     last_time = state.get("last_alerted_time")
     if last_time:
-        new_signals = [s for s in signals if str(s.time) > last_time]
+        parsed = pd.to_datetime(last_time, errors="coerce")
+        if pd.notna(parsed):
+            last_time_dt = parsed.to_pydatetime().replace(tzinfo=None)
+            new_signals = [
+                s for s in signals
+                if pd.Timestamp(s.time).to_pydatetime().replace(tzinfo=None) > last_time_dt
+            ]
+        else:
+            new_signals = []
     else:
         # prima rulare -- nu alertam retroactiv, doar marcam punctul de start
         new_signals = []
@@ -61,7 +83,8 @@ def main():
 
     if signals:
         state["last_alerted_time"] = str(signals[-1].time)
-        save_state(state)
+
+    save_state(state)
 
 
 if __name__ == "__main__":
