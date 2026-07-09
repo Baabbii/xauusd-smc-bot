@@ -43,6 +43,25 @@ def save_state(state: dict) -> None:
         json.dump(state, f)
 
 
+def _generate_with_fallback(
+    m15: pd.DataFrame, m5: pd.DataFrame, m1: pd.DataFrame, cfg: Config
+) -> tuple[list, str]:
+    signals = generate_signals(m15, m5, m1, cfg)
+    if signals:
+        return signals, "strict"
+
+    relaxed_cfg = Config(**vars(cfg))
+    relaxed_cfg.fvg_min_size_pips = min(cfg.fvg_min_size_pips, 3)
+    relaxed_cfg.bos_confirm_close = False
+    relaxed_cfg.bos_swing_lookback = min(cfg.bos_swing_lookback, 10)
+    relaxed_cfg.max_bars_between_ob_and_fvg = max(cfg.max_bars_between_ob_and_fvg, 200)
+    relaxed_cfg.max_bars_between_fvg_and_bos = max(cfg.max_bars_between_fvg_and_bos, 360)
+    relaxed_cfg.session_start_hour = 0
+    relaxed_cfg.session_end_hour = 24
+
+    return generate_signals(m15, m5, m1, relaxed_cfg), "fallback"
+
+
 def main():
     api_key = os.environ.get("TWELVEDATA_API_KEY")
     if not api_key:
@@ -58,7 +77,8 @@ def main():
 
     print(f"Bare primite -> M1: {len(m1)}, M5: {len(m5)}, M15: {len(m15)}")
 
-    signals = generate_signals(m15, m5, m1, cfg)
+    signals, mode = _generate_with_fallback(m15, m5, m1, cfg)
+    print(f"Mod semnale: {mode}; total găsite: {len(signals)}")
 
     last_time = state.get("last_alerted_time")
     if last_time:
@@ -78,11 +98,15 @@ def main():
     if new_signals:
         print(f"Semnale noi găsite: {len(new_signals)}")
         alert_new_signals(new_signals)
+        state["last_alerted_time"] = str(new_signals[-1].time)
     else:
-        print("Niciun semnal nou.")
-
-    if signals:
-        state["last_alerted_time"] = str(signals[-1].time)
+        if signals:
+            print(
+                "Semnale există, dar niciunul nu e nou față de state "
+                f"(ultimul semnal: {signals[-1].time}, state: {state.get('last_alerted_time')})."
+            )
+        else:
+            print("Niciun semnal nou.")
 
     save_state(state)
 
